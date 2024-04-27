@@ -1,0 +1,4 @@
+wandb
+local_train_dir
+ckpt
+__pycache__/
