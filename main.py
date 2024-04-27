@@ -81,20 +81,20 @@ _encodings["uint8"] = uint8
 @click.option("--num_train_epochs", default=5, help="Number of training epochs")
 @click.option("--learning_rate", default=1e-4, help="Learning rate")
 @click.option("--offload", default=False, help="Offload")
-@click.option("--train_batch_size", default=512, help="Train batch size")
+@click.option("--train_batch_size", default=256, help="Train batch size")
 @click.option(
-    "--per_device_train_batch_size", default=64, help="Per device train batch size"
+    "--per_device_train_batch_size", default=32, help="Per device train batch size"
 )
 @click.option("--zero_stage", default=2, help="Zero stage")
 @click.option("--seed", default=42, help="Seed")
 @click.option("--run_name", default=None, help="Run name")
 def main(
     local_rank,
+    train_batch_size,
+    per_device_train_batch_size,
     num_train_epochs=5,
     learning_rate=1e-4,
     offload=False,
-    train_batch_size=512,
-    per_device_train_batch_size=64,
     zero_stage=2,
     seed=42,
     run_name=None,
@@ -148,7 +148,7 @@ def main(
     with deepspeed.zero.Init(enabled=(zero_stage == 3)):
 
         ddpm = DDPM(
-            DiT_Llama(4, dim=768, n_layers=12, n_heads=12, num_classes=1000),
+            DiT_Llama(4, dim=1024, n_layers=12, n_heads=16, num_classes=1000),
             1000,
         ).cuda()
 
@@ -248,7 +248,7 @@ def main(
 
             global_step += 1
 
-            if global_step % 3000 == 1:
+            if global_step % 1000 == 1:
                 save_zero_three_model(
                     model_engine, global_rank, "./ckpt", zero_stage=zero_stage
                 )
