@@ -39,23 +39,21 @@ class DDPM(nn.Module):
 
         return self.criterion(eps, self.eps_model(x_t, t, cond))
 
-    def sample(self, n_sample: int, size, device) -> torch.Tensor:
-
+    def sample(self, size, device, conditions=[0, 1, 2, 3]) -> torch.Tensor:
+        n_sample = len(conditions)
         x_i = torch.randn(n_sample, *size).to(device)  # x_T ~ N(0, 1)
-        y = torch.arange(0, n_sample).reshape(-1).to(device)
+        y = torch.tensor(conditions).to(device)
         null_idx = torch.tensor([1000] * n_sample).reshape(-1).to(device)
 
         # This samples accordingly to Algorithm 2. It is exactly the same logic.
         for i in range(self.n_T, 0, -1):
             z = torch.randn(n_sample, *size).to(device) if i > 1 else 0
-            eps = self.eps_model(
-                x_i, torch.tensor(i).to(device).repeat(n_sample), y
-            )
+            eps = self.eps_model(x_i, torch.tensor(i).to(device).repeat(n_sample), y)
             eps_null = self.eps_model(
                 x_i, torch.tensor(i).to(device).repeat(n_sample), null_idx
             )
 
-            eps = eps_null + 3.0 * (eps - eps_null)
+            eps = eps_null + 1.5 * (eps - eps_null)
 
             x_i = (
                 self.oneover_sqrta[i] * (x_i - eps * self.mab_over_sqrtmab[i])

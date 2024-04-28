@@ -8,18 +8,17 @@ import deepspeed
 import numpy as np
 import streaming.base.util as util
 import torch
+import wandb
+from ddpm import DDPM
 from deepspeed import get_accelerator
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from deepspeed.utils import logger
+from dit_model import DiT_Llama
 from streaming import StreamingDataset
 from streaming.base.format.mds.encodings import Encoding, _encodings
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import get_scheduler
-
-import wandb
-from ddpm import DDPM
-from dit_model import DiT_Llama
 
 
 def _z3_params_to_fetch(param_list):
@@ -30,13 +29,13 @@ def _z3_params_to_fetch(param_list):
     ]
 
 
-def save_zero_three_model(model_ema, global_rank, save_dir, zero_stage=0):
+def save_zero_three_model(model, global_rank, save_dir, zero_stage=0):
     zero_stage_3 = zero_stage == 3
     os.makedirs(save_dir, exist_ok=True)
     WEIGHTS_NAME = "pytorch_model.bin"
     output_model_file = os.path.join(save_dir, WEIGHTS_NAME)
 
-    model_to_save = model_ema.module if hasattr(model_ema, "module") else model_ema
+    model_to_save = model.module if hasattr(model, "module") else model
     if not zero_stage_3:
         if global_rank == 0:
             torch.save(model_to_save.state_dict(), output_model_file)
@@ -55,6 +54,42 @@ def save_zero_three_model(model_ema, global_rank, save_dir, zero_stage=0):
         if global_rank == 0:
             torch.save(output_state_dict, output_model_file)
         del output_state_dict
+
+
+@torch.no_grad()
+def extract_model_state_dict_deepspeed(model, global_rank):
+    output_state_dict = {}
+    for k, v in model.named_parameters():
+        if hasattr(v, "ds_id"):
+            with deepspeed.zero.GatheredParameters(
+                _z3_params_to_fetch([v]), enabled=True
+            ):
+                v_p = v.data.cpu()
+        else:
+            v_p = v.cpu()
+
+        if global_rank == 0:
+            output_state_dict[k] = v_p.detach()
+
+    return output_state_dict
+
+
+def moving_average(model, model_ema, beta=0.992, device=None, zero_stage=0):
+    zero_stage_3 = zero_stage == 3
+    with torch.no_grad():
+        for param, param_ema in zip(model.parameters(), model_ema.parameters()):
+            # TODO: use prefiltering for efficiency
+            params_to_fetch = (
+                _z3_params_to_fetch([param, param_ema]) if zero_stage_3 else []
+            )
+            should_gather_param = len(params_to_fetch) > 0
+            with deepspeed.zero.GatheredParameters(
+                params_to_fetch, enabled=should_gather_param
+            ):
+                data = param.data
+                if device is not None:
+                    data = data.to(device)
+                param_ema.data.copy_(torch.lerp(data, param_ema.data, beta))
 
 
 def set_seed(seed=42):
@@ -92,13 +127,14 @@ def main(
     local_rank,
     train_batch_size,
     per_device_train_batch_size,
-    num_train_epochs=5,
+    num_train_epochs=2000,
     learning_rate=1e-4,
     offload=False,
     zero_stage=2,
     seed=42,
     run_name=None,
     train_dir="../vae_mds",
+    skipped_ema_step=16,
 ):
     # first, set the seed
     set_seed(seed)
@@ -144,13 +180,16 @@ def main(
     global_rank = torch.distributed.get_rank()
 
     ##### DEFINE model, dataset, sampler, dataloader, optim, schedular
-    N = 256
+
     with deepspeed.zero.Init(enabled=(zero_stage == 3)):
 
         ddpm = DDPM(
-            DiT_Llama(4, dim=1024, n_layers=12, n_heads=16, num_classes=1000),
+            DiT_Llama(4, dim=1024, n_layers=16, n_heads=16, num_classes=1000),
             1000,
         ).cuda()
+
+    ema_state_dict1 = extract_model_state_dict_deepspeed(ddpm, global_rank)
+    ema_state_dict2 = extract_model_state_dict_deepspeed(ddpm, global_rank)
 
     total_params = sum(p.numel() for p in ddpm.parameters())
     size_in_bytes = total_params * 4
@@ -238,20 +277,75 @@ def main(
             get_accelerator().empty_cache()
             norm = model_engine.get_global_grad_norm()
 
-            if global_step % 10 == 0:
+            global_step += 1
+
+            if global_step % skipped_ema_step == 1:
+
+                current_state_dict = extract_model_state_dict_deepspeed(
+                    ddpm, global_rank
+                )
+
                 if global_rank == 0:
-                    wandb.log({"train_loss": loss.item(), "train_grad_norm": norm})
+
+                    # update ema.
+                    BETA1 = (1 - 1 / global_step) ** (1 + 16)
+                    BETA2 = (1 - 1 / global_step) ** (1 + 9)
+
+                    # adjust beta for skipped-ema
+                    BETA1 = 1 - (1 - BETA1) * skipped_ema_step
+                    BETA1 = max(0, BETA1)
+                    BETA2 = 1 - (1 - BETA2) * skipped_ema_step
+                    BETA2 = max(0, BETA2)
+
+                    value = None
+                    ema1_of_value = None
+                    ema2_of_value = None
+
+                    for k, v in current_state_dict.items():
+                        ema_state_dict1[k] = (
+                            BETA1 * ema_state_dict1[k] + (1 - BETA1) * v
+                        )
+                        ema_state_dict2[k] = (
+                            BETA2 * ema_state_dict2[k] + (1 - BETA2) * v
+                        )
+                        # log 1st value for sanity check
+                        if value is None:
+                            value = v.half().flatten()[0].item()
+                            ema1_of_value = (
+                                ema_state_dict1[k].half().flatten()[0].item()
+                            )
+                            ema2_of_value = (
+                                ema_state_dict2[k].half().flatten()[0].item()
+                            )
+
+                    wandb.log(
+                        {
+                            "train_loss": loss.item(),
+                            "train_grad_norm": norm,
+                            "value": value,
+                            "ema1_of_value": ema1_of_value,
+                            "ema2_of_value": ema2_of_value,
+                        }
+                    )
 
             pbar.set_description(
                 f"norm: {norm}, loss: {loss.item()}, global_step: {global_step}"
             )
 
-            global_step += 1
+            if global_step % 800 == 1:
 
-            if global_step % 1000 == 1:
+                os.makedirs(f"./ckpt/model_{global_step}", exist_ok=True)
                 save_zero_three_model(
-                    model_engine, global_rank, "./ckpt", zero_stage=zero_stage
+                    model_engine,
+                    global_rank,
+                    f"./ckpt/model_{global_step}/",
+                    zero_stage=zero_stage,
                 )
+
+                # save ema weights
+                if global_rank == 0:
+                    torch.save(ema_state_dict1, f"./ckpt/model_{global_step}/ema1.pt")
+                    torch.save(ema_state_dict2, f"./ckpt/model_{global_step}/ema2.pt")
 
                 print(f"Model saved at {global_step}")
 

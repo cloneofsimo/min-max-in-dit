@@ -2,6 +2,13 @@
 
 In a similar spirit to the Keller Jordan's [Fastest CIFAR-10 training](https://github.com/KellerJordan/cifar10-airbench), I want to be the fastest diffusion trainer in the east. I'll keep the progress here. Currently very much WIP.
 
+Featuring:
+
+* DeepSpeed training of Diffusion Transformer
+* CPU-offloaded, skipped EMA trick for Karras' Post-hoc EMA analysis, where you EMA once in every `N` steps instead.
+* DDPM sampling
+* Featuring Streaming Dataset
+
 ## Dataset
 
 I am currently using `imagenet.int8`, one that I made lol [check here](https://huggingface.co/datasets/cloneofsimo/imagenet.int8). Since this dataset is so small, you don't need to setup massive remote data setup stuff, just point to the `local_dir`, set `remote_dir` to `None`. 

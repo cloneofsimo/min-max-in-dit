@@ -2,3 +2,4 @@ wandb
 local_train_dir
 ckpt
 __pycache__/
+*_image.png
