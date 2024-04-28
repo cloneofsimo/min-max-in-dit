@@ -184,7 +184,7 @@ def main(
     with deepspeed.zero.Init(enabled=(zero_stage == 3)):
 
         ddpm = DDPM(
-            DiT_Llama(4, dim=1024, n_layers=16, n_heads=16, num_classes=1000),
+            DiT_Llama(4, dim=1024, n_layers=12, n_heads=16, num_classes=1000),
             1000,
         ).cuda()
 
