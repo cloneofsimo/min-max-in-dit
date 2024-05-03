@@ -37,7 +37,12 @@ class DDPM(nn.Module):
             + self.sqrtmab[t, None, None, None] * eps
         )  # This is the x_t, which is sqrt(alphabar) x_0 + sqrt(1-alphabar) * eps
 
-        return self.criterion(eps, self.eps_model(x_t, t, cond))
+        # return self.criterion(eps, self.eps_model(x_t, t, cond))
+        sqerr = (eps - self.eps_model(x_t, t, cond)) ** 2
+        batchwise_loss = sqerr.mean(dim=(1, 2, 3))
+        return batchwise_loss.mean(), {
+            "batchwise_loss": batchwise_loss.detach().tolist()
+        }
 
     def sample(self, size, device, conditions=[0, 1, 2, 3]) -> torch.Tensor:
         n_sample = len(conditions)

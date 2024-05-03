@@ -85,6 +85,10 @@ class Attention(nn.Module):
         self.wv = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(n_heads * self.head_dim, dim, bias=False)
 
+        # self.sr = nn.Conv2d(dim, dim, groups=dim, kernel_size=2, stride=2)
+        # self.sr.weight.data.fill_(1/2**2)
+        # self.sr.bias.data.zero_()
+
         self.q_norm = nn.LayerNorm(self.n_heads * self.head_dim)
         self.k_norm = nn.LayerNorm(self.n_heads * self.head_dim)
 
@@ -92,22 +96,32 @@ class Attention(nn.Module):
     def reshape_for_broadcast(freqs_cis, x):
         ndim = x.ndim
         assert 0 <= 1 < ndim
-        assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+        # assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+        _freqs_cis = freqs_cis[: x.shape[1]]
         shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-        return freqs_cis.view(*shape)
+        return _freqs_cis.view(*shape)
 
     @staticmethod
     def apply_rotary_emb(xq, xk, freqs_cis):
         xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
         xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-        freqs_cis = Attention.reshape_for_broadcast(freqs_cis, xq_)
-        xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-        xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+        freqs_cis_xq = Attention.reshape_for_broadcast(freqs_cis, xq_)
+        freqs_cis_xk = Attention.reshape_for_broadcast(freqs_cis, xk_)
+
+        xq_out = torch.view_as_real(xq_ * freqs_cis_xq).flatten(3)
+        xk_out = torch.view_as_real(xk_ * freqs_cis_xk).flatten(3)
         return xq_out, xk_out
 
     def forward(self, x, freqs_cis):
         bsz, seqlen, _ = x.shape
+
+        h = w = int(seqlen**0.5)
+        # perform learned downsample
+        # xP = x.view(bsz, h, w, -1).permute(0, 3, 1, 2)
+        # xP = self.sr(xP).permute(0, 2, 3, 1).flatten(1, 2)
+
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
         dtype = xq.dtype
 
         xq = self.q_norm(xq)
