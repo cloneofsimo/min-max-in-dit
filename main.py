@@ -8,17 +8,18 @@ import deepspeed
 import numpy as np
 import streaming.base.util as util
 import torch
-import wandb
-from ddpm import DDPM
 from deepspeed import get_accelerator
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from deepspeed.utils import logger
-from dit_model import DiT_Llama
 from streaming import StreamingDataset
 from streaming.base.format.mds.encodings import Encoding, _encodings
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import get_scheduler
+
+import wandb
+from ddpm import DDPM
+from dit_model import DiT_Llama
 
 
 def _z3_params_to_fetch(param_list):
@@ -74,24 +75,6 @@ def extract_model_state_dict_deepspeed(model, global_rank):
     return output_state_dict
 
 
-def moving_average(model, model_ema, beta=0.992, device=None, zero_stage=0):
-    zero_stage_3 = zero_stage == 3
-    with torch.no_grad():
-        for param, param_ema in zip(model.parameters(), model_ema.parameters()):
-            # TODO: use prefiltering for efficiency
-            params_to_fetch = (
-                _z3_params_to_fetch([param, param_ema]) if zero_stage_3 else []
-            )
-            should_gather_param = len(params_to_fetch) > 0
-            with deepspeed.zero.GatheredParameters(
-                params_to_fetch, enabled=should_gather_param
-            ):
-                data = param.data
-                if device is not None:
-                    data = data.to(device)
-                param_ema.data.copy_(torch.lerp(data, param_ema.data, beta))
-
-
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -113,7 +96,7 @@ _encodings["uint8"] = uint8
 
 @click.command()
 @click.option("--local_rank", default=-1, help="Local rank")
-@click.option("--num_train_epochs", default=5, help="Number of training epochs")
+@click.option("--num_train_epochs", default=2000, help="Number of training epochs")
 @click.option("--learning_rate", default=1e-4, help="Learning rate")
 @click.option("--offload", default=False, help="Offload")
 @click.option("--train_batch_size", default=256, help="Train batch size")
@@ -127,8 +110,8 @@ def main(
     local_rank,
     train_batch_size,
     per_device_train_batch_size,
-    num_train_epochs=2000,
-    learning_rate=1e-4,
+    num_train_epochs,
+    learning_rate,
     offload=False,
     zero_stage=2,
     seed=42,
@@ -184,9 +167,18 @@ def main(
     with deepspeed.zero.Init(enabled=(zero_stage == 3)):
 
         ddpm = DDPM(
-            DiT_Llama(4, dim=1024, n_layers=12, n_heads=16, num_classes=1000),
+            DiT_Llama(
+                4,
+                dim=512,
+                n_layers=12,
+                n_heads=16,
+                num_classes=1000,
+                ffn_dim_multiplier=8,
+            ),
             1000,
         ).cuda()
+
+        # ddpm.load_state_dict(torch.load("/mnt/chatbot30TB/simoryu/debugs/imgnet/min-max-in-dit/ckpt/model_24801/ema1.pt", map_location="cpu"), strict = False)
 
     ema_state_dict1 = extract_model_state_dict_deepspeed(ddpm, global_rank)
     ema_state_dict2 = extract_model_state_dict_deepspeed(ddpm, global_rank)
@@ -224,7 +216,9 @@ def main(
 
     torch.distributed.barrier()
 
-    optimizer = torch.optim.AdamW(ddpm.eps_model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.AdamW(
+        ddpm.eps_model.parameters(), lr=learning_rate, weight_decay=0.1
+    )
 
     lr_scheduler = get_scheduler(
         name="linear",
@@ -241,6 +235,9 @@ def main(
 
     global_step = 0
 
+    # T-wise loss statistics
+    tloss_stats = {k: 0 for k in range(10)}
+    tloss_counts = {k: 1 for k in range(10)}
     ##### actual training loop
 
     if global_rank == 0:
@@ -270,7 +267,7 @@ def main(
             t = torch.randint(1, ddpm.n_T + 1, (x.shape[0],)).to(x.device)
             y = torch.tensor(list(map(int, batch["label"]))).long().to(x.device)
 
-            loss = model_engine(x, t, y)
+            loss, info = model_engine(x, t, y)
             model_engine.backward(loss)
             model_engine.step()
 
@@ -278,6 +275,13 @@ def main(
             norm = model_engine.get_global_grad_norm()
 
             global_step += 1
+            if global_rank == 0:
+                batchwise_loss = info["batchwise_loss"]
+                # check t-wise loss
+                for ts, individual_loss in zip(t.tolist(), batchwise_loss):
+                    ts = int((ts - 1) / 100)
+                    tloss_stats[ts] += individual_loss
+                    tloss_counts[ts] += 1
 
             if global_step % skipped_ema_step == 1:
 
@@ -325,8 +329,16 @@ def main(
                             "value": value,
                             "ema1_of_value": ema1_of_value,
                             "ema2_of_value": ema2_of_value,
+                            **{
+                                f"twise_loss_{k}": tloss_stats[k] / tloss_counts[k]
+                                for k in range(10)
+                            },
                         }
                     )
+
+                    # reset
+                    tloss_stats = {k: 0 for k in range(10)}
+                    tloss_counts = {k: 1 for k in range(10)}
 
             pbar.set_description(
                 f"norm: {norm}, loss: {loss.item()}, global_step: {global_step}"
